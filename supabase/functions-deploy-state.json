@@ -1,0 +1,9 @@
+{
+  "projectId": "72427096",
+  "functions": {
+    "create-checkout-session": {
+      "hasChanged": false,
+      "hash": "d15794dd036e8473192b947f6169b705e74b2b378ca4b1d2ecfc6f88fcee3bd9"
+    }
+  }
+}
