@@ -1,6 +1,6 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
-import { fromProductRow, type CartItem, type Order, type Product, type ProductRow, type Review, type User, type View } from '@/types';
+import { fromProductRow, type CartItem, type CartItemRow, type Order, type Product, type ProductRow, type Review, type User, type View } from '@/types';
 import DemoPaymentForm from '@/components/DemoPaymentForm';
 import { categories, currency, formatDate, isValidEmail } from '@/lib/utils';
 import {
@@ -698,10 +698,19 @@ export default function App() {
   const [selectedProductId, setSelectedProductId] = useState<number | null>(null);
   const [stripeReady] = useState(() => !!import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY);
 
+  const cartSyncing = useRef(false);
+
   useEffect(() => {
-    try { const savedCart = localStorage.getItem('nexa-cart'); if (savedCart) setCart(JSON.parse(savedCart) as CartItem[]); } catch { setCart([]); }
-  }, []);
-  useEffect(() => { localStorage.setItem('nexa-cart', JSON.stringify(cart)); }, [cart]);
+    // Guests still use localStorage so they don't lose items before signing in.
+    if (!user || user.role === 'admin') {
+      try { const savedCart = localStorage.getItem('nexa-cart'); if (savedCart) setCart(JSON.parse(savedCart) as CartItem[]); } catch { setCart([]); }
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (user && user.role !== 'admin') return; // signed-in customers persist to Supabase, not localStorage
+    localStorage.setItem('nexa-cart', JSON.stringify(cart));
+  }, [cart, user]);
 
   const navigate = (next: View) => {
     setView(next);
@@ -781,6 +790,55 @@ export default function App() {
     });
   }, [user]);
 
+  // Load the signed-in customer's saved cart and merge with any guest cart.
+  useEffect(() => {
+    if (!user || user.role !== 'customer') return;
+    let mounted = true;
+    void (async () => {
+      const { data: rows, error } = await supabase.from('cart_items').select('id, user_id, product_id, quantity');
+      if (error) { console.error('[cart] load error:', error.message); return; }
+      if (!mounted) return;
+      const savedRows = (rows || []) as CartItemRow[];
+      const savedItems = savedRows
+        .map((row) => {
+          const product = products.find((p) => p.id === row.product_id);
+          return product ? { ...product, quantity: row.quantity } : null;
+        })
+        .filter((item): item is CartItem => item !== null);
+      const guestCart = cart;
+      const merged = new Map<number, CartItem>();
+      savedItems.forEach((item) => merged.set(item.id, item));
+      guestCart.forEach((item) => {
+        const existing = merged.get(item.id);
+        if (existing) merged.set(item.id, { ...existing, quantity: existing.quantity + item.quantity });
+        else merged.set(item.id, item);
+      });
+      setCart(Array.from(merged.values()));
+      cartSyncing.current = true;
+    })();
+    return () => { mounted = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
+  // Persist the cart to Supabase for signed-in customers whenever it changes.
+  useEffect(() => {
+    if (!user || user.role !== 'customer' || !cartSyncing.current) return;
+    void (async () => {
+      const { error } = await supabase.from('cart_items').upsert(
+        cart.map((item) => ({ user_id: user.id, product_id: item.id, quantity: item.quantity })),
+        { onConflict: 'user_id,product_id' }
+      );
+      if (error) console.error('[cart] sync error:', error.message);
+      // Remove rows for products no longer in the cart.
+      const keptIds = cart.map((item) => item.id);
+      const { data: dbRows } = await supabase.from('cart_items').select('product_id');
+      const staleIds = ((dbRows || []) as CartItemRow[]).map((r) => r.product_id).filter((id) => !keptIds.includes(id));
+      if (staleIds.length) {
+        void supabase.from('cart_items').delete().in('product_id', staleIds);
+      }
+    })();
+  }, [cart, user]);
+
   const loginAsAdminBypass = () => { localStorage.setItem('nexa-admin-bypass', '1'); setAdminBypass(true); setUser({ id: 'admin-bypass', name: 'Nexa Admin', email: 'admin@tech.com', role: 'admin' }); navigate('admin'); };
   const login = async (email: string, password: string) => {
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
@@ -825,10 +883,13 @@ export default function App() {
     const { data, error } = await supabase.rpc('create_order', { p_items: items.map((item) => ({ id: item.id, quantity: item.quantity })) });
     if (error || !data) throw error || new Error('Order was not created');
     setCart([]);
+    if (user && user.role === 'customer') {
+      const { error: clearError } = await supabase.from('cart_items').delete().eq('user_id', user.id);
+      if (clearError) console.error('[cart] clear error after order:', clearError.message);
+    }
     const orderId = String(data);
     const { data: latestOrders } = await supabase.from('orders').select('id, email, items, total, created_at, status').order('created_at', { ascending: false });
     if (latestOrders) setOrders((latestOrders as Array<{ id: string; email: string; items: CartItem[]; total: number; created_at: string; status: string }>).map((o) => ({ id: o.id, email: o.email, items: o.items, total: Number(o.total), date: o.created_at, status: o.status })));
-    // Refresh products to get updated stock
     const { data: refreshed } = await supabase.from('products').select('id, name, category, price, original_price, rating, reviews, image, badge, stock').order('created_at');
     if (refreshed) setProducts(((refreshed as ProductRow[]).map(fromProductRow)));
     return orderId;
@@ -854,7 +915,7 @@ export default function App() {
   if (loading && view === 'store') return <div className="auth-shell"><div className="text-sm font-semibold text-slate-500">Loading NexaTech...</div></div>;
   if (view === 'login' || view === 'signup') return <AuthPage mode={view} onMode={setView} onLogin={login} onSignup={signup} onAdminBypass={loginAsAdminBypass} onBack={() => navigate('store')} />;
   if (view === 'admin') return (user?.role === 'admin' || adminBypass) ? <AdminPage products={products} orders={orders} onSaveProduct={saveProduct} onDeleteProduct={deleteProduct} onLogout={logout} onStore={() => navigate('store')} /> : <AuthPage mode="login" onMode={setView} onLogin={login} onSignup={signup} onAdminBypass={loginAsAdminBypass} onBack={() => navigate('store')} />;
-  if (view === 'demo-pay') { const demoTotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0) || 0; return <DemoPaymentForm total={demoTotal} onBack={() => navigate('store')} onComplete={async () => { setCart([]); }} />; }
+  if (view === 'demo-pay') { const demoTotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0) || 0; return <DemoPaymentForm total={demoTotal} onBack={() => navigate('store')} onComplete={async () => { setCart([]); if (user && user.role === 'customer') { const { error: clearError } = await supabase.from('cart_items').delete().eq('user_id', user.id); if (clearError) console.error('[cart] clear error after demo:', clearError.message); } }} />; }
   if (view === 'product' && selectedProduct) return <div className="min-h-screen bg-[#f8f9fc] text-slate-900"><Header user={user} cartCount={cart.reduce((s, i) => s + i.quantity, 0)} search={search} setSearch={setSearch} onView={navigate} onCart={() => setCartOpen(true)} /><ProductDetail product={selectedProduct} user={user} onAdd={addToCart} onBuyNow={buyNow} onBack={() => navigate('store')} /></div>;
   if (view === 'account' && user) return <div className="min-h-screen bg-[#f8f9fc] text-slate-900"><Header user={user} cartCount={cart.reduce((s, i) => s + i.quantity, 0)} search={search} setSearch={setSearch} onView={navigate} onCart={() => setCartOpen(true)} /><AccountPage user={user} orders={orders} onView={navigate} onLogout={logout} /></div>;
   if (view === 'orders' && user) return <div className="min-h-screen bg-[#f8f9fc] text-slate-900"><Header user={user} cartCount={cart.reduce((s, i) => s + i.quantity, 0)} search={search} setSearch={setSearch} onView={navigate} onCart={() => setCartOpen(true)} /><OrdersPage orders={orders} onBack={() => navigate('store')} /></div>;

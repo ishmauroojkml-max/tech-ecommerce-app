@@ -43,6 +43,13 @@ export type View = 'store' | 'login' | 'signup' | 'admin' | 'account' | 'orders'
 
 export type ProductRow = Omit<Product, 'originalPrice'> & { original_price: number; stock?: number };
 
+export type CartItemRow = {
+  id: string;
+  user_id: string;
+  product_id: number;
+  quantity: number;
+};
+
 export const fromProductRow = (row: ProductRow): Product => ({
   ...row,
   originalPrice: Number(row.original_price),
